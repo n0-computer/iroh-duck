@@ -1,23 +1,16 @@
-import { useState } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
-import "./App.css";
+import React from "react";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+import Terminal from "./Terminal";
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/v1/guides/features/command
-    setGreetMsg(await invoke("run_query", { q: name }));
-  }
-
+export default function App() {
   return (
-    <div className="container">
-      <form
+    <div className="w-screen h-screen bg-zinc-700 p-5">
+      <Terminal />
+      {/* <form
         className="row"
         onSubmit={(e) => {
           e.preventDefault();
-          greet();
+          query();
         }}
       >
         <input
@@ -27,10 +20,7 @@ function App() {
         />
         <button type="submit">Greet</button>
       </form>
-
-      <p>{greetMsg}</p>
+      <p>{greetMsg}</p> */}
     </div>
   );
 }
-
-export default App;
