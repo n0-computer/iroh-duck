@@ -17,6 +17,7 @@ const Terminal: React.FC = () => {
     const terminal = new XTerm({
       // set the line width to 80 characters
       cols: 84,
+      // cols: 1000,
       cursorBlink: true, // Show the cursor blinking
       fontSize: 14, // Set the font size for the terminal
       theme: {
@@ -57,10 +58,12 @@ const Terminal: React.FC = () => {
       // console.log(key.type, key.code);
       if (key.type == 'keypress' && key.metaKey) {
         switch (key.code) {
+          case 'KeyC':
+            clipboard.writeText(input);
+            return false;
           case 'KeyV':
             clipboard.readText().then((text) => {
               if (text === null) return;
-              console.log('writing clipboard text')
               input += text;
               terminal.write(text);
             });
