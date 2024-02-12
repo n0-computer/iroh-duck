@@ -500,26 +500,16 @@ async fn forward_range(
     let (_size, mime) = get_mime_type(gateway, hash, name, &connection).await?;
     tracing::debug!("mime: {}", mime);
 
-    // need to round up the chunk ranges to the nearest 1024 byte boundary
-    let cache_chunk_ranges = if !chunk_ranges.is_all() {
-        RangeSet2::from([start, start + Some(1024 as u64)])
-        // RangeSpecSeq::from_ranges(vec![RangeSet2::from([start, start + 1024])])
-    } else {
-        chunk_ranges.clone()
-    };
-
     let chunk_ranges = RangeSpecSeq::from_ranges(vec![chunk_ranges]);
-    let cache_chunk_ranges = RangeSpecSeq::from_ranges(vec![cache_chunk_ranges]);
     tracing::debug!("chunk_ranges {:?}", chunk_ranges);
 
     if let Some(addr) = remote_addr {
         // if chunk ranges specifies any range smaller than 0-1024, replace with a 1024 byte minimum
-
         let req = iroh::rpc_protocol::BlobDownloadRangesRequest {
             root: *hash,
             node: addr,
             tag: iroh::rpc_protocol::SetTagOption::Auto,
-            ranges: cache_chunk_ranges.clone(),
+            ranges: chunk_ranges.clone(),
         };
         let res = node.client().blobs.download_ranges(req).await?;
         let outcome = res.finish().await?;
@@ -534,7 +524,7 @@ async fn forward_range(
         );
     }
 
-    let request = iroh::bytes::protocol::GetRequest::new(*hash, chunk_ranges.clone());
+    let request = iroh::bytes::protocol::GetRequest::new(*hash, chunk_ranges);
     let status_code = if byte_ranges.is_all() {
         StatusCode::OK
     } else {
