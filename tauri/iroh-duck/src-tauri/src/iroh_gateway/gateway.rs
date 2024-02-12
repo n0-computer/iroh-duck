@@ -1,15 +1,14 @@
-use anyhow::Context;
 use axum::{
     body::Body,
     extract::Path,
     http::{header, Method, Request, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Extension, Router,
+    Extension, Json, Router,
 };
 use bytes::Bytes;
 use derive_more::Deref;
-use iroh::bytes::{store::bao_tree::ByteNum, BlobFormat};
+use futures::stream::StreamExt;
 use iroh::{
     bytes::{
         format::collection::Collection,
@@ -21,10 +20,16 @@ use iroh::{
     net::{MagicEndpoint, NodeAddr},
     ticket::BlobTicket,
 };
+use iroh::{
+    bytes::{protocol::RangeSpec, store::bao_tree::ByteNum, BlobFormat},
+    rpc_protocol::BlobListIncompleteResponse,
+};
+use iroh::{node::Node, rpc_protocol::BlobListResponse};
 use lru::LruCache;
 use mime::Mime;
 use mime_classifier::MimeClassifier;
 use range_collections::RangeSet2;
+use serde::Serialize;
 // use ranges::parse_byte_range;
 use std::{
     result,
@@ -76,7 +81,7 @@ struct Inner {
     /// Endpoint to connect to nodes
     endpoint: MagicEndpoint,
     /// Default node to connect to when not specified in the url
-    default_node: Option<NodeAddr>,
+    default_node: Node<iroh::bytes::store::flat::Store>,
     /// Mime classifier
     #[debug("MimeClassifier")]
     mime_classifier: MimeClassifier,
@@ -88,19 +93,17 @@ struct Inner {
 
 impl Inner {
     /// Get the default node to connect to when not specified in the url
-    fn default_node(&self) -> anyhow::Result<NodeAddr> {
-        let node_addr = self
-            .default_node
-            .clone()
-            .context("default node not configured")?;
-        Ok(node_addr)
+    fn default_node(&self) -> anyhow::Result<Node<iroh::bytes::store::flat::Store>> {
+        let node = self.default_node.clone();
+        Ok(node)
     }
 
     /// Get the mime type for a hash from the remote node.
     async fn get_default_connection(&self) -> anyhow::Result<quinn::Connection> {
+        let node_addr = self.default_node()?.my_addr().await?;
         let connection = self
             .endpoint
-            .connect(self.default_node()?, iroh::bytes::protocol::ALPN)
+            .connect(node_addr, iroh::bytes::protocol::ALPN)
             .await?;
         Ok(connection)
     }
@@ -253,15 +256,69 @@ async fn get_mime_type(
     Ok(sm)
 }
 
+#[derive(Serialize)]
+pub struct BlobInfo {
+    pub hash: Hash,
+    pub size: u64,
+    // pub mime: String,
+    pub ranges: RangeSpec,
+}
+
+async fn handle_local_blobs(
+    gateway: Extension<Gateway>,
+) -> std::result::Result<Json<Vec<BlobInfo>>, AppError> {
+    tracing::debug!("handle_local_blobs");
+    let client = gateway.default_node()?.client();
+    let mut response = client.blobs.list().await?;
+
+    let mut blobs = Vec::new();
+    while let Some(item) = response.next().await {
+        tracing::debug!("item {:?}", item);
+        let BlobListResponse {
+            path: _,
+            hash,
+            size,
+        } = item?;
+        // println!("{} {} ({})", path, hash, HumanBytes(size));
+        let ranges = client.blobs.get_valid_ranges(hash).await?;
+        blobs.push(BlobInfo {
+            hash,
+            size,
+            // mime: "application/octet-stream".to_string(),
+            ranges,
+        });
+    }
+
+    tracing::debug!("listing incomplete blobs");
+    let mut response = client.blobs.list_incomplete().await?;
+    while let Some(item) = response.next().await {
+        tracing::debug!("incomplete item {:?}", item);
+        let BlobListIncompleteResponse {
+            hash,
+            expected_size,
+            size,
+        } = item?;
+        tracing::info!("incomplete blob: {} {} ({})", hash, expected_size, size);
+        let ranges = client.blobs.get_valid_ranges(hash).await?;
+        blobs.push(BlobInfo {
+            hash,
+            size: expected_size,
+            // mime: "application/octet-stream".to_string(),
+            ranges,
+        });
+    }
+
+    Ok(Json(blobs))
+}
+
 /// Handle a request for a range of bytes from the default node.
 async fn handle_local_blob_request(
     gateway: Extension<Gateway>,
     Path(blake3_hash): Path<Hash>,
     req: Request<Body>,
 ) -> std::result::Result<Response<Body>, AppError> {
-    let connection = gateway.get_default_connection().await?;
     let byte_range = parse_byte_range(req).await?;
-    let res = forward_range(&gateway, connection, &blake3_hash, None, byte_range).await?;
+    let res = forward_range(&gateway, None, &blake3_hash, None, byte_range).await?;
     Ok(res)
 }
 
@@ -269,9 +326,8 @@ async fn handle_local_collection_index(
     gateway: Extension<Gateway>,
     Path(hash): Path<Hash>,
 ) -> std::result::Result<impl IntoResponse, AppError> {
-    let connection = gateway.get_default_connection().await?;
     let link_prefix = format!("/collection/{}", hash);
-    let res = collection_index(&gateway, connection, &hash, &link_prefix).await?;
+    let res = collection_index(&gateway, None, &hash, &link_prefix).await?;
     Ok(res)
 }
 
@@ -294,19 +350,23 @@ async fn handle_ticket_index(
 ) -> std::result::Result<impl IntoResponse, AppError> {
     tracing::info!("handle_ticket_index");
     let byte_range = parse_byte_range(req).await?;
-    let connection = gateway
-        .endpoint
-        .connect(ticket.node_addr().clone(), iroh::bytes::protocol::ALPN)
-        .await?;
     let hash = ticket.hash();
     let prefix = format!("/ticket/{}", ticket);
     let res = match ticket.format() {
-        BlobFormat::Raw => forward_range(&gateway, connection, &hash, None, byte_range)
-            .await?
-            .into_response(),
-        BlobFormat::HashSeq => collection_index(&gateway, connection, &hash, &prefix)
-            .await?
-            .into_response(),
+        BlobFormat::Raw => forward_range(
+            &gateway,
+            Some(ticket.node_addr().clone()).clone(),
+            &hash,
+            None,
+            byte_range,
+        )
+        .await?
+        .into_response(),
+        BlobFormat::HashSeq => {
+            collection_index(&gateway, Some(ticket.node_addr().clone()), &hash, &prefix)
+                .await?
+                .into_response()
+        }
     };
     Ok(res)
 }
@@ -322,6 +382,7 @@ async fn handle_ticket_request(
         .endpoint
         .connect(ticket.node_addr().clone(), iroh::bytes::protocol::ALPN)
         .await?;
+    tracing::debug!("connected: {:?}", ticket.node_addr());
     let hash = ticket.hash();
     let res = forward_collection_range(&gateway, connection, &hash, &suffix, byte_range).await?;
     Ok(res)
@@ -329,10 +390,20 @@ async fn handle_ticket_request(
 
 async fn collection_index(
     gateway: &Gateway,
-    connection: quinn::Connection,
+    addr: Option<NodeAddr>,
     hash: &Hash,
     link_prefix: &str,
 ) -> anyhow::Result<impl IntoResponse> {
+    tracing::debug!("collection_index");
+    let connection = match addr {
+        Some(addr) => {
+            gateway
+                .endpoint
+                .connect(addr, iroh::bytes::protocol::ALPN)
+                .await?
+        }
+        None => gateway.get_default_connection().await?,
+    };
     fn encode_relative_url(relative_url: &str) -> anyhow::Result<String> {
         let base = Url::parse("http://example.com")?;
         let joined_url = base.join(relative_url)?;
@@ -371,12 +442,14 @@ async fn forward_collection_range(
     suffix: &str,
     range: (Option<u64>, Option<u64>),
 ) -> anyhow::Result<impl IntoResponse> {
+    tracing::debug!("forward_collection_range");
     let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
     tracing::trace!("suffix {}", suffix);
     let collection = get_collection(gateway, hash, &connection).await?;
     for (name, hash) in collection.iter() {
         if name == suffix {
-            let res = forward_range(gateway, connection, hash, Some(suffix), range).await?;
+            let res: hyper::Response<Body> =
+                forward_range_connection(gateway, connection, hash, Some(suffix), range).await?;
             return Ok(res.into_response());
         } else {
             tracing::trace!("'{}' != '{}'", name, suffix);
@@ -401,6 +474,146 @@ fn format_content_range(start: Option<u64>, end: Option<u64>, size: u64) -> Stri
 
 async fn forward_range(
     gateway: &Gateway,
+    remote_addr: Option<NodeAddr>,
+    hash: &Hash,
+    name: Option<&str>,
+    (start, end): (Option<u64>, Option<u64>),
+) -> anyhow::Result<Response<Body>> {
+    let node = gateway.default_node()?;
+    let connection = match remote_addr.clone() {
+        Some(addr) => {
+            gateway
+                .endpoint
+                .connect(addr.clone(), iroh::bytes::protocol::ALPN)
+                .await?
+        }
+        None => gateway.get_default_connection().await?,
+    };
+
+    // we need both byte ranges and chunk ranges.
+    // chunk ranges to request data, and byte ranges to return the data.
+    tracing::debug!("forward_range {:?} {:?} (name {name:?})", start, end);
+
+    let byte_ranges = to_byte_range(start, end);
+    let chunk_ranges = to_chunk_range(start, end);
+    tracing::debug!("got connection");
+    let (_size, mime) = get_mime_type(gateway, hash, name, &connection).await?;
+    tracing::debug!("mime: {}", mime);
+
+    // need to round up the chunk ranges to the nearest 1024 byte boundary
+    let cache_chunk_ranges = if !chunk_ranges.is_all() {
+        RangeSet2::from([start, start + Some(1024 as u64)])
+        // RangeSpecSeq::from_ranges(vec![RangeSet2::from([start, start + 1024])])
+    } else {
+        chunk_ranges.clone()
+    };
+
+    let chunk_ranges = RangeSpecSeq::from_ranges(vec![chunk_ranges]);
+    let cache_chunk_ranges = RangeSpecSeq::from_ranges(vec![cache_chunk_ranges]);
+    tracing::debug!("chunk_ranges {:?}", chunk_ranges);
+
+    if let Some(addr) = remote_addr {
+        // if chunk ranges specifies any range smaller than 0-1024, replace with a 1024 byte minimum
+
+        let req = iroh::rpc_protocol::BlobDownloadRangesRequest {
+            root: *hash,
+            node: addr,
+            tag: iroh::rpc_protocol::SetTagOption::Auto,
+            ranges: cache_chunk_ranges.clone(),
+        };
+        let res = node.client().blobs.download_ranges(req).await?;
+        let outcome = res.finish().await?;
+        println!(
+            "local: {} remote: {}",
+            outcome.local_size, outcome.downloaded_size
+        );
+        tracing::info!(
+            "local: {} remote: {}",
+            outcome.local_size,
+            outcome.downloaded_size,
+        );
+    }
+
+    let request = iroh::bytes::protocol::GetRequest::new(*hash, chunk_ranges.clone());
+    let status_code = if byte_ranges.is_all() {
+        StatusCode::OK
+    } else {
+        StatusCode::PARTIAL_CONTENT
+    };
+    tracing::debug!("status_code {}", status_code);
+    let (send, recv) = flume::bounded::<result::Result<Bytes, DecodeError>>(2);
+    tracing::trace!("requesting {:?}", request);
+    let req = iroh::bytes::get::fsm::start(connection.clone(), request);
+    let connected = req.next().await?;
+    let ConnectedNext::StartRoot(x) = connected.next().await? else {
+        anyhow::bail!("unexpected response");
+    };
+    tracing::trace!("connected");
+    let (mut current, size) = x.next().next().await?;
+    tokio::spawn(async move {
+        let end = loop {
+            match current.next().await {
+                BlobContentNext::More((next, Ok(item))) => {
+                    match item {
+                        BaoContentItem::Leaf(leaf) => {
+                            tracing::trace!("got leaf {} {}", leaf.offset, leaf.data.len());
+                            for item in slice(leaf.offset.0, leaf.data, byte_ranges.clone()) {
+                                send.send_async(Ok(item)).await?;
+                            }
+                        }
+                        BaoContentItem::Parent(parent) => {
+                            tracing::trace!("got parent {:?}", parent);
+                        }
+                    }
+                    current = next;
+                }
+                BlobContentNext::More((_, Err(err))) => {
+                    send.send_async(Err(err)).await?;
+                    anyhow::bail!("error");
+                }
+                BlobContentNext::Done(end) => break end,
+            }
+        };
+        let EndBlobNext::Closing(at_closing) = end.next() else {
+            anyhow::bail!("unexpected response");
+        };
+        let _stats = at_closing.next().await?;
+        Ok(())
+    });
+    let body = Body::from_stream(recv.into_stream());
+    // let body = Body::from_stream(res.into_stream());
+    let builder = Response::builder()
+        .status(status_code)
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CACHE_CONTROL, "public,max-age=31536000,immutable")
+        .header(header::CONTENT_TYPE, mime.to_string());
+    // content-length needs to be the actual repsonse size
+    let transfer_size = match (start, end) {
+        (Some(start), Some(end)) => end - start,
+        (Some(start), None) => size - start,
+        (None, Some(end)) => end,
+        (None, None) => size,
+    };
+    let builder = builder.header(header::CONTENT_LENGTH, transfer_size);
+
+    let builder = if start.is_some() || end.is_some() {
+        builder
+            .header(
+                header::CONTENT_RANGE,
+                format_content_range(start, end, size),
+            )
+            .status(StatusCode::PARTIAL_CONTENT)
+    } else {
+        builder
+    };
+    let response = builder.body(body).unwrap();
+    Ok(response)
+}
+
+// uses an existing quinn connection to forward a range request to a remote node
+// does NOT cache on the local node
+async fn forward_range_connection(
+    gateway: &Gateway,
     connection: quinn::Connection,
     hash: &Hash,
     name: Option<&str>,
@@ -416,6 +629,7 @@ async fn forward_range(
     let (_size, mime) = get_mime_type(gateway, hash, name, &connection).await?;
     tracing::debug!("mime: {}", mime);
     let chunk_ranges = RangeSpecSeq::from_ranges(vec![chunk_ranges]);
+
     let request = iroh::bytes::protocol::GetRequest::new(*hash, chunk_ranges.clone());
     let status_code = if byte_ranges.is_all() {
         StatusCode::OK
@@ -424,7 +638,6 @@ async fn forward_range(
     };
     tracing::debug!("status_code {}", status_code);
     let (send, recv) = flume::bounded::<result::Result<Bytes, DecodeError>>(2);
-
     tracing::trace!("requesting {:?}", request);
     let req = iroh::bytes::get::fsm::start(connection.clone(), request);
     let connected = req.next().await?;
@@ -492,13 +705,15 @@ async fn forward_range(
     Ok(response)
 }
 
-pub async fn run(default_node: NodeAddr, magic_port: u16, addr: &str) -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
+pub async fn run(
+    default_node: Node<iroh::bytes::store::flat::Store>,
+    magic_port: u16,
+    addr: &str,
+) -> anyhow::Result<()> {
     let endpoint = MagicEndpoint::builder().bind(magic_port).await?;
     let gateway = Gateway(Arc::new(Inner {
         endpoint,
-        default_node: Some(default_node),
+        default_node,
         mime_classifier: MimeClassifier::new(),
         mime_cache: Mutex::new(LruCache::new(100000.try_into().unwrap())),
         collection_cache: Mutex::new(LruCache::new(1000.try_into().unwrap())),
@@ -511,6 +726,7 @@ pub async fn run(default_node: NodeAddr, magic_port: u16, addr: &str) -> anyhow:
 
     #[rustfmt::skip]
     let app = Router::new()
+        .route("/blob", get(handle_local_blobs))
         .route("/blob/:blake3_hash", get(handle_local_blob_request))
         .route("/collection/:blake3_hash", get(handle_local_collection_index))
         .route("/collection/:blake3_hash/*path",get(handle_local_collection_request))
