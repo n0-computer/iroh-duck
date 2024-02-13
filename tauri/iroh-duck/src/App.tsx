@@ -8,9 +8,9 @@ export default function App() {
 
   return (
     <div className="w-screen h-screen bg-zinc-700 p-5">
-      <div className="flex">
-        <a onClick={() => setTab("query")} className="cursor-pointer">query</a>
-        <a onClick={() => setTab("blobs")} className="cursor-pointer">blobs</a>
+      <div className="flex mb-5">
+        <a onClick={() => setTab("query")} className="cursor-pointer pr-5 transition-all hover:text-blue-500">query</a>
+        <a onClick={() => setTab("blobs")} className="cursor-pointer pr-5 transition-all hover:text-blue-500">blobs</a>
       </div>
       {(() => {
         switch (tab) {

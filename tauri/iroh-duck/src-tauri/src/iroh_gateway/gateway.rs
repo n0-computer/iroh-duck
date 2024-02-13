@@ -30,7 +30,6 @@ use mime::Mime;
 use mime_classifier::MimeClassifier;
 use range_collections::RangeSet2;
 use serde::Serialize;
-// use ranges::parse_byte_range;
 use std::{
     result,
     sync::{Arc, Mutex},
@@ -492,36 +491,38 @@ async fn forward_range(
 
     // we need both byte ranges and chunk ranges.
     // chunk ranges to request data, and byte ranges to return the data.
-    tracing::debug!("forward_range {:?} {:?} (name {name:?})", start, end);
-
     let byte_ranges = to_byte_range(start, end);
     let chunk_ranges = to_chunk_range(start, end);
-    tracing::debug!("got connection");
+    let chunk_ranges = RangeSpecSeq::from_ranges(vec![chunk_ranges]);
+    // tracing::debug!(
+    //     "forward_range {:?} {:?} (name {name:?}) chunk ranges: {:?}",
+    //     start,
+    //     end,
+    //     chunk_ranges
+    // );
+
     let (_size, mime) = get_mime_type(gateway, hash, name, &connection).await?;
     tracing::debug!("mime: {}", mime);
 
-    let chunk_ranges = RangeSpecSeq::from_ranges(vec![chunk_ranges]);
-    tracing::debug!("chunk_ranges {:?}", chunk_ranges);
-
     if let Some(addr) = remote_addr {
-        // if chunk ranges specifies any range smaller than 0-1024, replace with a 1024 byte minimum
-        let req = iroh::rpc_protocol::BlobDownloadRangesRequest {
-            root: *hash,
-            node: addr,
-            tag: iroh::rpc_protocol::SetTagOption::Auto,
-            ranges: chunk_ranges.clone(),
-        };
-        let res = node.client().blobs.download_ranges(req).await?;
-        let outcome = res.finish().await?;
-        println!(
-            "local: {} remote: {}",
-            outcome.local_size, outcome.downloaded_size
-        );
-        tracing::info!(
-            "local: {} remote: {}",
-            outcome.local_size,
-            outcome.downloaded_size,
-        );
+        tracing::debug!("getting local ranges");
+        let local_ranges = node.client().blobs.get_valid_ranges(*hash).await?;
+        if local_ranges.is_all() {
+            tracing::debug!("local copy is complete");
+        } else if !byte_ranges.is_all() {
+            // tracing::debug!("local copy is partial: {:?}", local_ranges);
+            // TODO - check if requested ranges are in local ranges
+            // if they are, we can use the local copy
+            let req = iroh::rpc_protocol::BlobDownloadRangesRequest {
+                root: *hash,
+                node: addr,
+                tag: iroh::rpc_protocol::SetTagOption::Auto,
+                ranges: chunk_ranges.clone(),
+            };
+
+            let mut stream = node.client().blobs.download_ranges(req).await?;
+            while stream.next().await.is_some() {}
+        }
     }
 
     let request = iroh::bytes::protocol::GetRequest::new(*hash, chunk_ranges);
